@@ -1,4 +1,4 @@
-import { Plus, Download } from "lucide-react";
+import { Plus, Download, Camera } from "lucide-react";
 import { SummaryCard } from "../ui/SummaryCard";
 
 export const Header = ({
@@ -6,6 +6,7 @@ export const Header = ({
   totalDonations,
   totalEntries,
   onAddNew,
+  onScanReceipt,
   onExport,
 }) => {
   const summaryData = [
@@ -41,7 +42,7 @@ export const Header = ({
   return (
     <div className="bg-white rounded-lg shadow-sm p-6 mb-6">
       <h1 className="text-2xl font-bold text-gray-900 mb-2">
-        Business Expense & Donation Tracker
+        Business Money Manager
       </h1>
       <p className="text-gray-600 mb-4">
         Keep track of your business expenses and donations in one simple place
@@ -60,6 +61,13 @@ export const Header = ({
         >
           <Plus className="h-4 w-4" />
           Add New Entry
+        </button>
+        <button
+          onClick={onScanReceipt}
+          className="bg-orange-600 text-white px-4 py-2 rounded-lg hover:bg-orange-800 flex items-center gap-2 transition-colors"
+        >
+          <Camera className="h-4 w-4" />
+          Scan Receipt
         </button>
         <button
           onClick={onExport}

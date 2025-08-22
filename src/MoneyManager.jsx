@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { useLocalStorage } from "./hooks/useLocalStorage";
 import { calculateTotals } from "./utils/calculations";
 import { exportToCSV } from "./utils/dataExport";
@@ -6,9 +6,10 @@ import { ENTRY_TYPES } from "./constants/entryTypes";
 import { Header } from "./components/layout/Header";
 import { EntryForm } from "./components/forms/EntryForm";
 import { EntriesTable } from "./components/tables/EntriesTable";
+import { ReceiptScanner } from "./components/forms/ReceiptScanner";
 
 const MoneyManager = () => {
-  const [entries, setEntries] = useLocalStorage("businessEntries", []);
+  const [entries, setEntries] = useLocalStorage('moneyManagerEntries', []);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [currentEntry, setCurrentEntry] = useState({
@@ -20,6 +21,7 @@ const MoneyManager = () => {
     vendor: "",
     notes: "",
   });
+  const [showScanner, setShowScanner] = useState(false);
 
   const { totalExpenses, totalDonations } = calculateTotals(entries);
 
@@ -79,6 +81,20 @@ const MoneyManager = () => {
     exportToCSV(entries);
   };
 
+  const handleScanComplete = (scannedData) => {
+    setCurrentEntry({
+      type: ENTRY_TYPES.EXPENSE,
+      date: scannedData.date,
+      amount: scannedData.amount,
+      category: scannedData.category,
+      description: scannedData.description,
+      vendor: scannedData.vendor,
+      notes: scannedData.notes,
+    });
+    setShowScanner(false);
+    setShowForm(true);
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 p-4">
       <div className="max-w-6xl mx-auto">
@@ -87,8 +103,16 @@ const MoneyManager = () => {
           totalDonations={totalDonations}
           totalEntries={entries.length}
           onAddNew={() => setShowForm(true)}
+          onScanReceipt={() => setShowScanner(true)} // Add this prop
           onExport={handleExport}
         />
+
+        {showScanner && (
+          <ReceiptScanner
+            onScanComplete={handleScanComplete}
+            onClose={() => setShowScanner(false)}
+          />
+        )}
 
         {showForm && (
           <EntryForm
