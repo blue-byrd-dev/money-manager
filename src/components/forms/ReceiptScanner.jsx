@@ -58,14 +58,20 @@ async function downscaleImage(file, { maxDim = 1600, quality = 0.85 } = {}) {
 async function preprocessForOCR(blob) {
   const img = await (async () => {
     if ("createImageBitmap" in window) return await createImageBitmap(blob);
-    const im = new Image(); const url = URL.createObjectURL(blob);
-    await new Promise((res, rej) => (im.onload = res, im.onerror = rej, im.src = url));
-    URL.revokeObjectURL(url); return im;
+    const im = new Image();
+    const url = URL.createObjectURL(blob);
+    await new Promise(
+      (res, rej) => ((im.onload = res), (im.onerror = rej), (im.src = url))
+    );
+    URL.revokeObjectURL(url);
+    return im;
   })();
 
-  const w = img.width, h = img.height;
+  const w = img.width,
+    h = img.height;
   const canvas = document.createElement("canvas");
-  canvas.width = w; canvas.height = h;
+  canvas.width = w;
+  canvas.height = h;
   const ctx = canvas.getContext("2d", { alpha: false });
 
   ctx.drawImage(img, 0, 0, w, h);
@@ -73,20 +79,24 @@ async function preprocessForOCR(blob) {
   const d = imgData.data;
 
   const contrast = 1.25; // tweak 1.15–1.4
-  const thresh = 190;    // tweak 170–210
+  const thresh = 190; // tweak 170–210
 
   for (let i = 0; i < d.length; i += 4) {
-    const r = d[i], g = d[i + 1], b = d[i + 2];
-    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;           // grayscale luminance
-    y = (y - 128) * contrast + 128;                         // add contrast
-    const v = y > thresh ? 255 : 0;                         // simple threshold
-    d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+    const r = d[i],
+      g = d[i + 1],
+      b = d[i + 2];
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b; // grayscale luminance
+    y = (y - 128) * contrast + 128; // add contrast
+    const v = y > thresh ? 255 : 0; // simple threshold
+    d[i] = d[i + 1] = d[i + 2] = v;
+    d[i + 3] = 255;
   }
 
   ctx.putImageData(imgData, 0, 0);
-  return await new Promise(res => canvas.toBlob(b => res(b || blob), "image/png", 1));
+  return await new Promise((res) =>
+    canvas.toBlob((b) => res(b || blob), "image/png", 1)
+  );
 }
-
 
 const TOTAL_ANCHORS = [
   "TOTAL",
@@ -315,7 +325,6 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
         }
       }
     }
-
     return {
       amount: Number.isFinite(amount) ? amount : 0,
       vendor,
