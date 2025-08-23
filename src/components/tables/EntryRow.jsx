@@ -9,7 +9,7 @@ export const EntryRow = ({ entry, onEdit, onDelete }) => (
       <EntryTypeBadge type={entry.type} />
     </td>
     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-      ${entry.amount.toFixed(2)}
+      ${Number(entry.amount ?? 0).toFixed(2)}
     </td>
     <td className="px-6 py-4 text-sm text-gray-900">{entry.description}</td>
     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">

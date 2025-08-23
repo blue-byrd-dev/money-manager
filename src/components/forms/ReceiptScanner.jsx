@@ -2,36 +2,123 @@ import { useState, useRef } from "react";
 import { Camera, Upload, Loader2, X } from "lucide-react";
 import Tesseract from "tesseract.js";
 
+// --- downscale utility (add this above the component) ---
+// --- downscale utility (add above the component) ---
+async function downscaleImage(file, { maxDim = 1600, quality = 0.85 } = {}) {
+  if (!file || !file.type?.startsWith("image/")) return file;
+
+  const loadImage = async (blob) => {
+    if ("createImageBitmap" in window) {
+      try {
+        return await createImageBitmap(blob, {
+          imageOrientation: "from-image",
+        });
+      } catch {
+        /* fallback below */
+      }
+    }
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.decoding = "async";
+    const url = URL.createObjectURL(blob);
+    try {
+      await new Promise((res, rej) => {
+        img.onload = res;
+        img.onerror = rej;
+        img.src = url;
+      });
+      return img;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const img = await loadImage(file);
+  const w = img.width,
+    h = img.height;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  if (scale === 1) return file;
+
+  const tw = Math.max(1, Math.round(w * scale));
+  const th = Math.max(1, Math.round(h * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = tw;
+  canvas.height = th;
+
+  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, 0, 0, tw, th);
+
+  const blob = await new Promise((resolve) =>
+    canvas.toBlob((b) => resolve(b || file), "image/jpeg", quality)
+  );
+  return blob;
+}
+
 export const ReceiptScanner = ({ onScanComplete, onClose }) => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [previewImage, setPreviewImage] = useState(null);
+  const [statusText, setStatusText] = useState("");
+  const [ocrError, setOcrError] = useState(null);
+  const [lastFile, setLastFile] = useState(null);
+
   const fileInputRef = useRef(null);
 
+  // DRY + optimized: downscale -> OCR -> parse -> hand off
   const processImage = async (imageFile) => {
     setIsProcessing(true);
     setProgress(0);
+    setOcrError(null);
+    setStatusText("preparing…");
+    setProgress(5);
+    setLastFile(imageFile);
 
     try {
-      const result = await Tesseract.recognize(imageFile, "eng", {
+      const prepped = await downscaleImage(imageFile, {
+        maxDim: 1600,
+        quality: 0.85,
+      });
+
+      const result = await Tesseract.recognize(prepped, "eng", {
         logger: (m) => {
-          if (m.status === "recognizing text") {
+          if (m?.status) setStatusText(m.status);
+          if (
+            m?.status === "recognizing text" &&
+            typeof m.progress === "number"
+          ) {
             setProgress(Math.round(m.progress * 100));
           }
         },
       });
 
-      const extractedData = parseReceiptText(result.data.text);
-      onScanComplete(extractedData);
-    } catch (error) {
-      console.error("OCR Error:", error);
-      alert(
-        `Failed to process the image: ${error.message}. Please try again or enter manually.`
+      const extracted = parseReceiptText(result?.data?.text || "");
+
+      const parsedAmount = parseFloat(
+        (extracted.amount ?? "").toString().replace(/[,$]/g, "")
       );
+      const safeEntry = {
+        ...extracted,
+        amount: Number.isFinite(parsedAmount) ? parsedAmount : 0,
+      };
+
+      onScanComplete?.(safeEntry);
+
+      setStatusText("done");
+    } catch (err) {
+      console.error("OCR Error:", err);
+      setOcrError(err?.message || "OCR failed. Please try again.");
     } finally {
       setIsProcessing(false);
-      setProgress(0);
     }
+  };
+
+  const retryOCR = async () => {
+    if (!lastFile) return;
+    setProgress(5);
+    await processImage(lastFile);
   };
 
   const parseReceiptText = (text) => {
@@ -40,7 +127,6 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
       .map((line) => line.trim())
       .filter((line) => line);
 
-    // Extract total amount (look for patterns like $XX.XX, Total: XX.XX, etc.)
     const totalPatterns = [
       /(?:total|amount|sum)[\s:]*\$?(\d+\.?\d{0,2})/gi,
       /\$(\d+\.\d{2})/g,
@@ -51,7 +137,6 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
     for (const pattern of totalPatterns) {
       const matches = text.match(pattern);
       if (matches && matches.length > 0) {
-        // Get the last match which is often the total
         const lastMatch = matches[matches.length - 1];
         const numberMatch = lastMatch.match(/(\d+\.?\d{0,2})/);
         if (numberMatch) {
@@ -61,7 +146,6 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
       }
     }
 
-    // Extract vendor/store name (usually one of the first few lines)
     let vendor = "";
     for (let i = 0; i < Math.min(5, lines.length); i++) {
       const line = lines[i];
@@ -77,14 +161,13 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
       }
     }
 
-    // Extract date (look for date patterns)
     const datePatterns = [
       /(\d{1,2}\/\d{1,2}\/\d{4})/,
       /(\d{4}-\d{2}-\d{2})/,
       /(\d{1,2}-\d{1,2}-\d{4})/,
     ];
 
-    let date = new Date().toISOString().split("T")[0]; // Default to today
+    let date = new Date().toISOString().split("T")[0]; 
     for (const pattern of datePatterns) {
       const match = text.match(pattern);
       if (match) {
@@ -100,24 +183,28 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
       }
     }
 
+    const parsed = parseFloat((amount || "").replace(/[^0-9.]/g, ""));
     return {
-      amount: amount || "",
+      amount: Number.isFinite(parsed) ? parsed : 0,
       vendor: vendor || "",
       date: date,
       description: vendor ? `Purchase from ${vendor}` : "Scanned receipt",
-      category: "Office supplies",
+      category: "Supplies",
       notes: "Extracted from receipt scan",
     };
   };
 
   const handleFileSelect = (event) => {
     const file = event.target.files[0];
+    if (!file) return;
+
     if (file && file.type.startsWith("image/")) {
       const reader = new FileReader();
       reader.onload = (e) => {
         setPreviewImage(e.target.result);
       };
       reader.readAsDataURL(file);
+      setLastFile(file);
       processImage(file);
     }
   };
@@ -169,6 +256,7 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
             ref={fileInputRef}
             type="file"
             accept="image/*"
+            capture="environment"
             onChange={handleFileSelect}
             className="hidden"
           />
@@ -200,7 +288,31 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
               style={{ width: `${progress}%` }}
             ></div>
           </div>
-          <p className="text-sm text-gray-500">{progress}% complete</p>
+          <p className="text-sm text-gray-500">{statusText}</p>
+        </div>
+      )}
+
+      {ocrError && (
+        <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <div className="flex items-center justify-between gap-2">
+            <span>{ocrError}</span>
+            <div className="flex gap-2">
+              {!isProcessing && (
+                <button
+                  onClick={retryOCR}
+                  className="rounded px-2 py-1 text-red-700 hover:bg-red-100"
+                >
+                  Retry
+                </button>
+              )}
+              <button
+                onClick={() => setOcrError(null)}
+                className="rounded px-2 py-1 text-gray-700 hover:bg-gray-100"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

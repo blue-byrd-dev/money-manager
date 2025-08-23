@@ -10,7 +10,9 @@ export const EntryForm = ({
   editingId,
 }) => {
   const handleFieldChange = (field, value) => {
-    onEntryChange({ ...currentEntry, [field]: value });
+    onEntryChange({ 
+      ...currentEntry, 
+      [field]: field === "amount" ? parseFloat(value) || 0 : value });
   };
 
   return (
