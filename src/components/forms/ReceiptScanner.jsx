@@ -2,8 +2,6 @@ import { useState, useRef } from "react";
 import { Camera, Upload, Loader2, X } from "lucide-react";
 import Tesseract from "tesseract.js";
 
-// --- downscale utility (add this above the component) ---
-// --- downscale utility (add above the component) ---
 async function downscaleImage(file, { maxDim = 1600, quality = 0.85 } = {}) {
   if (!file || !file.type?.startsWith("image/")) return file;
 
@@ -57,6 +55,164 @@ async function downscaleImage(file, { maxDim = 1600, quality = 0.85 } = {}) {
   return blob;
 }
 
+async function preprocessForOCR(blob) {
+  const img = await (async () => {
+    if ("createImageBitmap" in window) return await createImageBitmap(blob);
+    const im = new Image(); const url = URL.createObjectURL(blob);
+    await new Promise((res, rej) => (im.onload = res, im.onerror = rej, im.src = url));
+    URL.revokeObjectURL(url); return im;
+  })();
+
+  const w = img.width, h = img.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d", { alpha: false });
+
+  ctx.drawImage(img, 0, 0, w, h);
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+
+  const contrast = 1.25; // tweak 1.15–1.4
+  const thresh = 190;    // tweak 170–210
+
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;           // grayscale luminance
+    y = (y - 128) * contrast + 128;                         // add contrast
+    const v = y > thresh ? 255 : 0;                         // simple threshold
+    d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return await new Promise(res => canvas.toBlob(b => res(b || blob), "image/png", 1));
+}
+
+
+const TOTAL_ANCHORS = [
+  "TOTAL",
+  "AMOUNT DUE",
+  "BALANCE DUE",
+  "GRAND TOTAL",
+  "TOTAL DUE",
+  "AMOUNT PAYABLE",
+  "AMOUNT DUE NOW",
+];
+
+const MONEY_RE = /(?:\$?\s*)(\d{1,3}(?:,\d{3})*\.\d{2})\b/;
+
+function normalizeMoney(s) {
+  const m = s.match(MONEY_RE);
+  if (!m) return null;
+  return parseFloat(m[1].replace(/,/g, ""));
+}
+
+function pickTotalFromLayout(result) {
+  const { lines, words } = result?.data || {};
+  if (!Array.isArray(lines) || !lines.length) return null;
+
+  // index words per line, sorted left→right
+  const lineWords = {};
+  for (const w of words || []) {
+    if (!lineWords[w.line]) lineWords[w.line] = [];
+    lineWords[w.line].push(w);
+  }
+  for (const k in lineWords) {
+    lineWords[k].sort((a, b) => (a.bbox?.x0 ?? 0) - (b.bbox?.x0 ?? 0));
+  }
+
+  // 1) anchor scan
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const text = (line.text || "").replace(/\s+/g, " ").trim();
+    const hit = TOTAL_ANCHORS.some((a) => text.toUpperCase().includes(a));
+    if (!hit) continue;
+
+    const wordsInLine = lineWords[line.line] || [];
+    // find rightmost anchor edge
+    let anchorX = null;
+    for (const w of wordsInLine) {
+      const up = (w.text || "").toUpperCase();
+      if (TOTAL_ANCHORS.some((a) => up.includes(a))) {
+        anchorX = Math.max(anchorX ?? 0, w.bbox?.x1 ?? 0);
+      }
+    }
+
+    // same line, to the right
+    const toRight = wordsInLine.filter(
+      (w) => (w.bbox?.x0 ?? 0) > (anchorX ?? 0)
+    );
+    for (const w of toRight) {
+      const val = normalizeMoney(w.text || "");
+      if (Number.isFinite(val)) return val;
+    }
+
+    // stacked on next line
+    const next = lines[i + 1];
+    if (next) {
+      const nextWords = lineWords[next.line] || [];
+      for (const w of nextWords) {
+        const val = normalizeMoney(w.text || "");
+        if (Number.isFinite(val)) return val;
+      }
+    }
+  }
+
+  // 2) fallback: largest money number on page
+  let best = null;
+  for (const w of words || []) {
+    const val = normalizeMoney(w.text || "");
+    if (Number.isFinite(val) && (best == null || val > best)) best = val;
+  }
+  return best;
+}
+
+// Add near the top of the file:
+const VENDOR_STOPWORDS = new Set([
+  "INVOICE",
+  "TAX INVOICE",
+  "STATEMENT",
+  "RECEIPT",
+  "SALES RECEIPT",
+  "BILL",
+  "ESTIMATE",
+  "QUOTE",
+  "ORDER",
+  "PURCHASE ORDER",
+]);
+
+function pickVendorFromLayout(result) {
+  const { lines } = result?.data || {};
+  if (!Array.isArray(lines) || !lines.length) return "";
+
+  // Find page height to limit search to upper area
+  const pageHeight = Math.max(...lines.map((l) => l.bbox?.y1 ?? 0));
+  const topCut = pageHeight * 0.35; // top 35%
+
+  // Collect candidate lines in the top band
+  const candidates = lines
+    .filter((l) => l?.text?.trim())
+    .filter((l) => (l.bbox?.y0 ?? Infinity) <= topCut)
+    .map((l) => ({
+      text: l.text.trim(),
+      height: Math.max(1, (l.bbox?.y1 ?? 0) - (l.bbox?.y0 ?? 0)),
+    }))
+    .filter((c) => {
+      const t = c.text.toUpperCase();
+      // filter: not just numbers/symbols, no prices, not a stopword
+      const looksLikeName = /[A-Z]/.test(t) && !/\$\s*\d/.test(t);
+      const notStop = ![...VENDOR_STOPWORDS].some((sw) => t.includes(sw));
+      return looksLikeName && notStop && t.length >= 3 && t.length <= 50;
+    });
+
+  if (!candidates.length) return "";
+
+  // Prefer the biggest text; tie-breaker: shorter text (logos are short)
+  candidates.sort(
+    (a, b) => b.height - a.height || a.text.length - b.text.length
+  );
+  return candidates[0].text;
+}
+
 export const ReceiptScanner = ({ onScanComplete, onClose }) => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -81,8 +237,11 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
         maxDim: 1600,
         quality: 0.85,
       });
+      const hiContrast = await preprocessForOCR(prepped);
 
-      const result = await Tesseract.recognize(prepped, "eng", {
+      const result = await Tesseract.recognize(hiContrast, "eng", {
+        tessedit_pageseg_mode: 6,
+        preserve_interword_spaces: "1",
         logger: (m) => {
           if (m?.status) setStatusText(m.status);
           if (
@@ -94,7 +253,7 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
         },
       });
 
-      const extracted = parseReceiptText(result?.data?.text || "");
+      const extracted = parseReceiptText(result?.data?.text || "", result);
 
       const parsedAmount = parseFloat(
         (extracted.amount ?? "").toString().replace(/[,$]/g, "")
@@ -121,44 +280,18 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
     await processImage(lastFile);
   };
 
-  const parseReceiptText = (text) => {
-    const lines = text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line);
-
-    const totalPatterns = [
-      /(?:total|amount|sum)[\s:]*\$?(\d+\.?\d{0,2})/gi,
-      /\$(\d+\.\d{2})/g,
-      /(\d+\.\d{2})/g,
-    ];
-
-    let amount = "";
-    for (const pattern of totalPatterns) {
-      const matches = text.match(pattern);
-      if (matches && matches.length > 0) {
-        const lastMatch = matches[matches.length - 1];
-        const numberMatch = lastMatch.match(/(\d+\.?\d{0,2})/);
-        if (numberMatch) {
-          amount = numberMatch[1];
-          break;
-        }
-      }
+  const parseReceiptText = (text, ocrResult) => {
+    let amount = pickTotalFromLayout(ocrResult);
+    if (!Number.isFinite(amount)) {
+      const fallback = (
+        text.match(/\$?\s*\d{1,3}(?:,\d{3})*\.\d{2}\b/g) || []
+      ).map((s) => parseFloat(s.replace(/[^0-9.]/g, "")));
+      amount = fallback.length ? fallback[fallback.length - 1] : 0;
     }
 
-    let vendor = "";
-    for (let i = 0; i < Math.min(5, lines.length); i++) {
-      const line = lines[i];
-      if (
-        line.length > 3 &&
-        line.length < 50 &&
-        !line.includes("$") &&
-        !line.match(/^\d+/) &&
-        !line.toLowerCase().includes("receipt")
-      ) {
-        vendor = line;
-        break;
-      }
+    let vendor = pickVendorFromLayout(ocrResult);
+    if (!vendor) {
+      vendor = fallbackVendorFromTopLines(text);
     }
 
     const datePatterns = [
@@ -167,7 +300,7 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
       /(\d{1,2}-\d{1,2}-\d{4})/,
     ];
 
-    let date = new Date().toISOString().split("T")[0]; 
+    let date = new Date().toISOString().split("T")[0];
     for (const pattern of datePatterns) {
       const match = text.match(pattern);
       if (match) {
@@ -183,16 +316,40 @@ export const ReceiptScanner = ({ onScanComplete, onClose }) => {
       }
     }
 
-    const parsed = parseFloat((amount || "").replace(/[^0-9.]/g, ""));
     return {
-      amount: Number.isFinite(parsed) ? parsed : 0,
-      vendor: vendor || "",
+      amount: Number.isFinite(amount) ? amount : 0,
+      vendor,
       date: date,
       description: vendor ? `Purchase from ${vendor}` : "Scanned receipt",
       category: "Supplies",
       notes: "Extracted from receipt scan",
     };
   };
+  // Simple fallback if pickVendorFromLayout() doesn't return anything
+  function fallbackVendorFromTopLines(text) {
+    const lines = text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l);
+
+    for (const l of lines.slice(0, 6)) {
+      // check first ~6 lines
+      const upper = l.toUpperCase();
+      if (
+        upper.length > 2 &&
+        !/^\d/.test(upper) && // skip lines starting with numbers
+        !upper.includes("INVOICE") &&
+        !upper.includes("STATEMENT") &&
+        !upper.includes("RECEIPT") &&
+        !upper.includes("TOTAL") &&
+        !/^\$?\d+/.test(upper) // skip amounts
+      ) {
+        return l;
+      }
+    }
+
+    return "";
+  }
 
   const handleFileSelect = (event) => {
     const file = event.target.files[0];
